@@ -1,0 +1,23 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fmodern\fcharset0 Courier;}
+{\colortbl;\red255\green255\blue255;\red183\green187\blue184;\red30\green31\blue33;}
+{\*\expandedcolortbl;;\cssrgb\c76863\c78039\c77255;\cssrgb\c15686\c16471\c17255;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 Create a C# class which takes device credentials such as ipAddress(string), port(int), username(string), password(string). The class has an asynchronous method  named as FetchAsync which returns and instance of DeviceInfo. DeviceInfo is a model class which contains the properties of the device to be monitored. The FetchAsync method creates of instances of different inheriting Command classes and makes of the ExecuteAsync method. Take proper care of error handling, such that connection exceptions such as SocketException, TimeoutException and other connection exceptions from Prims.Telnet library are not handled.\
+\
+\'97\'97\'97\'97\'97\'97\'97\
+\
+Create an abstract C# command class for communicating with a remote device using Telnet protocol. The class should  contain an abstract property named as Message which will be of type string. The class should contain an asynchronous method named as ExecuteAsync which returns string. The method takes user name, password and other optional parameters and cancellation token. The command structure looks like 
+\f1\fs28 \cf2 \cb3 \expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 <P><UN>Username</UN><Pwd>Password</Pwd><Cmd>Command</Cmd><P1>Parameter 1</P1>...<P10>Parameter 10</P10></P>\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 \cb1 \kerning1\expnd0\expndtw0 \outl0\strokewidth0 \'97\'97\'97\'97\'97\'97\'97\
+\
+Create a C# class for instantiating the different command classes for fetching device data.\
+\
+Create an abstract C# class for communicating with a remote device using SSH protocol. Make use of Renci.SSH.Net library for performing communication with the device.\
+\
+Create C# classes for implementing command classes for different properties such as for firmwareVersion : \'93<Get FirmwareVersion>\'94, SerialNumber: \'93<Get SerialNum>\'94, model: \'93<Get Model>\'94}

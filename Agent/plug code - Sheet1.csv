@@ -1,0 +1,2485 @@
+Serial Num,Plugin Name,Class Name,Protocol,Library,Code,Comment
+1,APCPDU,Command.cs,SSH,RenciSSH.NET,"using CDC.Plugin.APCPDU.Extensions.Threading;
+using CDC.Plugin.APCPDU.Properties;
+using Renci.SshNet;
+using System.Text;
+using CDC.Core.Logging;
+
+namespace CDC.Plugin.APCPDU.Communication.Commands
+{
+    public abstract class Command
+    {
+        /// <summary>
+        /// The SSH connection client to be used by this class.
+        /// </summary>
+        private readonly SshClient? _client;
+
+        /// <summary>
+        /// This member is only used during unit tests to provide a mock
+        /// stream that can be used to simulate different test scenarios.
+        /// </summary>
+        private Stream? _stream;
+
+        /// <summary>
+        /// The message to be sent to the remote device.
+        /// </summary>
+        protected abstract string Message { get; }
+
+        /// <summary>
+        /// Constructor.
+        /// </summary>
+        /// <param name=""client"">The connection instance.</param>
+        public Command(SshClient client)
+        {
+            _client = client;
+        }
+
+        /// <summary>
+        /// Constructor. To be used only for mocking.
+        /// </summary>
+        /// <param name=""stream"">The stream instance.</param>
+        public Command(Stream stream)
+        {
+            _stream = stream;
+        }
+
+        /// <summary>
+        /// Dispatches the message to the device and returns a response back when it is completed.
+        /// </summary>
+        /// <param name=""token"">Token to cancel the execution.</param>
+        /// <param name=""logger""></param>
+        /// <returns>An awaitable task.</returns>
+        /// <exception cref=""InvalidOperationException""></exception>
+        public async Task<string> ExecuteAsync(CancellationToken token, IEngineLogger logger)
+        {
+            /// At least one of _client or _stream must be initialized
+            /// in order to proceed with this operation.
+            if (_client is null && _stream is null)
+            {
+                throw new InvalidOperationException(Resource.InvalidOperationStatusMessage);
+            }
+
+            /// If the client is already connected, we do not
+            /// need to connect to the client. This could happen
+            /// if the device is connected and the previous operation
+            /// has failed due to some reason without triggering the
+            /// retry.
+            if (_client is not null && !_client.IsConnected)
+            {
+                await _client.ConnectAsync(token);
+                _stream = _client.CreateShellStreamNoTerminal();
+            }
+
+            using var reader = new StreamReader(_stream!);
+
+            /// Limit the operation by creating a time-bound cancellation token
+            var timeBoundCts = token.CreateTimeBoundLinkedTokenSource(TimeSpan.FromSeconds(20));
+
+            /// Reading the heading & welcome message from the device.
+            _ = await ReadResponseAsync(reader, timeBoundCts.Token);
+
+            /// Sending the command to the device.
+            using var writer = new StreamWriter(_stream!) { AutoFlush = true };
+            await writer.WriteAsync(Message.AsMemory(), timeBoundCts.Token);
+
+            /// Reading the response for the command.
+            var response = await ReadResponseAsync(reader, timeBoundCts.Token);
+
+            logger.LogDebug(summary: () => $""command: {Message}"", details: () => $""RawResponse: {response}"");
+            _client?.Disconnect();
+
+            return response;
+        }
+
+        /// <summary>
+        /// Read respones received from the device till the designated
+        /// end-of-response sequence and return it as a string.
+        /// </summary>
+        /// <param name=""reader"">The reader to be used for the task.</param>
+        /// <param name=""token"">Token to cancel the execution.</param>
+        /// <returns>An awaitable task.</returns>S
+        private static async Task<string> ReadResponseAsync(StreamReader reader, CancellationToken token)
+        {
+            var result = new StringBuilder();
+            var buffer = new char[1024];
+
+            int bytesRead;
+            while (!reader.EndOfStream && (bytesRead = await reader.ReadAsync(buffer, token)) > 0)
+            {
+                string content = new string(buffer, 0, bytesRead);
+                content = content.TrimEnd('\0').Trim('\n');
+                result.Append(content);
+
+                if (content.Contains(""apc>""))
+                {
+                    break; // Found the prompt, we're done
+                }
+        
+                Array.Clear(buffer, 0, buffer.Length);
+            }
+            return result.ToString();
+        }
+    }
+}",Recieves welcome string at the time of connection establishment
+2,APCPDU,DeviceInfoApiClient.cs,SSH,RenciSSH.NET,"using CDC.Core.Logging;
+using CDC.Plugin.APCPDU.Communication.Commands;
+using CDC.Plugin.APCPDU.Configuration;
+using CDC.Plugin.APCPDU.Parsers.Definitions;
+using Renci.SshNet;
+using Renci.SshNet.Common;
+using System.Net.Sockets;
+
+namespace CDC.Plugin.APCPDU.Communication
+{
+    public class DeviceInfoApiClient
+    {
+        private readonly PDUConfiguration _configuration;
+
+        private readonly IEngineLogger _logger;
+
+        /// <summary>
+        /// Maps the TokenTypes with their corresponding OutletId,
+        /// this map is used for setting the values for outlet state
+        /// of the PolledOutlet and add it to deviceInfo.Outlets.
+        /// </summary>
+        private readonly IReadOnlyDictionary<TokenType, string> TokenTypeOutletMap = new Dictionary<TokenType, string>()
+        {
+            { TokenType.OutletStatusOne, ""1"" },
+            { TokenType.OutletStatusTwo, ""2"" },
+            { TokenType.OutletStatusThree, ""3"" },
+            { TokenType.OutletStatusFour, ""4"" },
+            { TokenType.OutletStatusFive, ""5"" },
+            { TokenType.OutletStatusSix, ""6"" },
+            { TokenType.OutletStatusSeven, ""7"" },
+            { TokenType.OutletStatusEight, ""8"" }
+        };
+
+        public DeviceInfoApiClient(PDUConfiguration configuration, IEngineLogger logger)
+        {
+            _configuration = configuration;
+            _logger = logger;
+        }
+
+        public async Task<DeviceInfo> FetchAsync(CancellationToken token)
+        {
+            using var connection = new SshClient(_configuration.IPAddress, _configuration.Username, _configuration.Password);
+            var processor = new ResponseProcessor();
+
+            /// Abort the connection attempt if it takes longer than 10 seconds.
+            /// The policy handles the exception that is thrown and retries
+            /// the operation after a delay.
+            connection.ConnectionInfo.Timeout = TimeSpan.FromSeconds(10);
+            Command command;
+            string rawResponse;
+            var deviceInfo = new DeviceInfo();
+
+            try
+            {
+                command = new GetOlStatusCommand(connection);
+                rawResponse = await command.ExecuteAsync(token, _logger);
+                var response = processor.Execute(rawResponse);
+                if (response.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value == ""Success"")
+                {
+                    foreach (var element in TokenTypeOutletMap)
+                    {
+                        if (response.TryGetValue(element.Key, out var state))
+                        {
+                            deviceInfo.Outlets.TryAdd(element.Value, new() { Status = state.Value == ""On"" });
+                        }
+                    }
+                }
+            }
+            catch (Exception exception)
+            when (exception is not OperationCanceledException
+                && exception is not TaskCanceledException
+                && exception is not SshAuthenticationException
+                && exception is not SocketException
+                && exception is not TimeoutException
+                && exception is not SshConnectionException)
+            {
+                LogErrorMessage(exception, ""Outlet Status"");
+            }
+
+            foreach (var phase in _configuration.Phases)
+            {
+                try
+                {
+                    command = new GetPhCurrentReadingCommand(connection, phase.PhaseId);
+                    rawResponse = await command.ExecuteAsync(token, _logger);
+                    var response = processor.Execute(rawResponse);
+                    if (response.TryGetValue(TokenType.ErrorResponse, out var operationState)
+                        && operationState.Value == ""Success""
+                        && response.TryGetValue(TokenType.String, out var current)
+                        && double.TryParse(current.Value[..^1], out var currentValue))
+                    {
+                        deviceInfo.Phases.TryAdd(phase.PhaseId, new()
+                        {
+                            PhaseCurrent = currentValue,
+                            IsUnderLoad = currentValue < phase.PhaseCurrentLowLoad,
+                            IsNearOverLoad = currentValue >= phase.PhaseCurrentNearOver && currentValue < phase.PhaseCurrentOverLoad,
+                            IsOverLoad = currentValue >= phase.PhaseCurrentOverLoad
+                        });
+                    }
+                }
+                catch (Exception exception)
+                when (exception is not OperationCanceledException
+                && exception is not TaskCanceledException
+                && exception is not SshAuthenticationException
+                && exception is not SocketException
+                && exception is not TimeoutException
+                && exception is not SshConnectionException)
+                {
+                    LogErrorMessage(exception, $""Phase Current of {phase.PhaseName}"");
+                }
+            }
+
+            try
+            {
+                command = new GetAboutCommand(connection);
+                rawResponse = await command.ExecuteAsync(token, _logger);
+                var responses = processor.Execute(rawResponse);
+                /// Adding a check whether the key exist in the response dictionary or not.
+                if (responses.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value == ""Success"")
+                {
+                    deviceInfo.ModelNumber = responses.TryGetValue(TokenType.Model, out var result) ? result.Value : string.Empty;
+                    deviceInfo.SerialNumber = responses.TryGetValue(TokenType.SerialNumber, out result) ? result.Value : string.Empty;
+                    deviceInfo.HardwareRevision = responses.TryGetValue(TokenType.HardwareRevision, out result) ? result.Value : string.Empty;
+                    deviceInfo.ManufactureDate = responses.TryGetValue(TokenType.ManufactureDate, out result) ? result.Value : string.Empty;
+                    deviceInfo.MACAddress = responses.TryGetValue(TokenType.MACAddress, out result) ? result.Value : string.Empty;
+                    deviceInfo.ManagementUpTime = responses.TryGetValue(TokenType.UpTime, out result) ? result.Value : string.Empty;
+                    deviceInfo.NetworkManagementCardModelNumber = responses.TryGetValue(TokenType.NetworkCardModelNumber, out result) ? result.Value : string.Empty;
+                    deviceInfo.NetworkManagementCardSerialNumber = responses.TryGetValue(TokenType.NetworkCardSerialNumber, out result) ? result.Value : string.Empty;
+                    deviceInfo.NetworkManagementCardHardwareRevision = responses.TryGetValue(TokenType.NetworkCardHardwareRevision, out result) ? result.Value : string.Empty;
+                }
+            }
+            catch (Exception exception)
+                when (exception is not OperationCanceledException
+                && exception is not TaskCanceledException
+                && exception is not SshAuthenticationException
+                && exception is not SocketException
+                && exception is not TimeoutException
+                && exception is not SshConnectionException)
+            {
+                LogErrorMessage(exception, $""About"");
+            }
+
+            try
+            {
+                command = new GetSystemInfoCommand(connection);
+                rawResponse = await command.ExecuteAsync(token, _logger);
+                var responses = processor.Execute(rawResponse);
+                if (responses.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value == ""Success"")
+                {
+                    deviceInfo.SystemHostNameSync = responses.TryGetValue(TokenType.HostNameSync, out var result) ? result.Value : string.Empty;
+                    deviceInfo.SystemName = responses.TryGetValue(TokenType.DeviceName, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemContact = responses.TryGetValue(TokenType.Contact, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemLocation = responses.TryGetValue(TokenType.Location, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemMessage = responses.TryGetValue(TokenType.Message, out result) ? result?.Value : string.Empty;
+                    deviceInfo.SystemDateTime = responses.TryGetValue(TokenType.DateTime, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemUser = responses.TryGetValue(TokenType.User, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemUpTime = responses.TryGetValue(TokenType.UpTime, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemStat = responses.TryGetValue(TokenType.Stat, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemAOS = responses.TryGetValue(TokenType.AOS, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemApp = responses.TryGetValue(TokenType.App, out result) ? result.Value : string.Empty;
+                    deviceInfo.SystemBootmon = responses.TryGetValue(TokenType.Bootmon, out result) ? result.Value : string.Empty;
+                }
+            }
+            catch (Exception exception)
+                when (exception is not OperationCanceledException
+                && exception is not TaskCanceledException
+                && exception is not SshAuthenticationException
+                && exception is not SocketException
+                && exception is not TimeoutException
+                && exception is not SshConnectionException)
+            {
+                LogErrorMessage(exception, ""System"");
+            }
+
+            try
+            {
+                command = new GetProductInfoCommand(connection);
+                rawResponse = await command.ExecuteAsync(token, _logger);
+                var responses = processor.Execute(rawResponse);
+                if (responses.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value == ""Success"")
+                {
+                    deviceInfo.SwitchedRackPDU = responses.TryGetValue(TokenType.SwitchedRackPdu, out var result) ? result.Value : string.Empty;
+
+                    if (responses.TryGetValue(TokenType.PresentOutlets, out result) && int.TryParse(result.Value, out var intResult))
+                    {
+                        deviceInfo.PresentOutlets = intResult;
+                    }
+                    if (responses.TryGetValue(TokenType.SwitchedOulets, out result) && int.TryParse(result.Value, out intResult))
+                    {
+                        deviceInfo.SwitchedOutlets = intResult;
+                    }
+                    if (responses.TryGetValue(TokenType.MeteredOutlets, out result) && int.TryParse(result.Value, out intResult))
+                    {
+                        deviceInfo.MeteredOutlets = intResult;
+                    }
+                    if (responses.TryGetValue(TokenType.MaxCurrent, out result) && double.TryParse(result.Value[..^1], out var floatResult))
+                    {
+                        deviceInfo.MaxCurrent = floatResult;
+                    }
+                    if (responses.TryGetValue(TokenType.PresentPhases, out result) && int.TryParse(result.Value, out intResult))
+                    {
+                        deviceInfo.PresentPhases = intResult;
+                    }
+                    if (responses.TryGetValue(TokenType.MeteredPhases, out result) && int.TryParse(result.Value, out intResult))
+                    {
+                        deviceInfo.MeteredPhases = intResult;
+                    }
+                    deviceInfo.NetworkLink = responses.TryGetValue(TokenType.NetworkLink, out result) ? result.Value : string.Empty;
+                }
+            }
+            catch (Exception exception)
+                when (exception is not OperationCanceledException
+                && exception is not TaskCanceledException
+                && exception is not SshAuthenticationException
+                && exception is not SocketException
+                && exception is not TimeoutException
+                && exception is not SshConnectionException)
+            {
+                LogErrorMessage(exception, $""Product Info"");
+            }
+
+            return deviceInfo;
+        }
+
+        private void LogErrorMessage(Exception exception, string propertyName)
+        {
+            _logger?.LogError(""Runtime Error"", $"" Exception occurred while fetching data for the {propertyName} from the server."", exception);
+        }
+    }
+}",makes connection for each command.
+3,APCPDU,MetaInfoApiClient.cs,SSH,RenciSSH.NET,"using CDC.Core.Logging;
+using CDC.Plugin.APCPDU.Communication.Commands;
+using CDC.Plugin.APCPDU.Configuration;
+using CDC.Plugin.APCPDU.Engine;
+using CDC.Plugin.APCPDU.Parsers.Definitions;
+using CDC.Plugin.APCPDU.Parsers.Errors;
+using CDC.Plugin.APCPDU.Properties;
+using CDC.Plugin.APCPDU.Result;
+using Polly;
+using Polly.Retry;
+using Renci.SshNet;
+using Renci.SshNet.Common;
+using System.Net.Sockets;
+
+namespace CDC.Plugin.APCPDU.Communication
+{
+    public class MetaInfoApiClient
+    {
+        private readonly string _ipAddress;
+        private readonly string _username;
+        private readonly string _password;
+        private readonly List<Phase> _configPhases;
+        private readonly IEngineLogger _logger;
+        private readonly Action<UpdateExtensionStatusEventArguments> _updateExtensionStatus;
+
+        public MetaInfoApiClient(string ipAddress, string username, string password, List<Phase> configPhases, IEngineLogger logger, Action<UpdateExtensionStatusEventArguments> updateExtensionStatus)
+        {
+            _ipAddress = ipAddress;
+            _username = username;
+            _password = password;
+            _configPhases = configPhases;
+            _logger = logger;
+            _updateExtensionStatus = updateExtensionStatus;
+        }
+
+        /// <summary>
+        /// Queries the device for the LowLoad,
+        /// NearOverLoad and OverLoad commands
+        /// for each of the phases.  The values
+        /// for these properties are set to the
+        /// corresponding properties of the
+        /// respective phase objects.
+        /// </summary>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<MetaInfoResult> FetchAsync(CancellationToken token)
+        {
+            var shouldHandleRetry = new PredicateBuilder<PhaseOutcome>()
+                .Handle<Exception>()
+                .HandleResult(response => !response.IsSuccess);
+
+            var retryOptions = new RetryStrategyOptions<PhaseOutcome>()
+            {
+                ShouldHandle = shouldHandleRetry,
+                MaxRetryAttempts = int.MaxValue,
+                DelayGenerator = RetryDelayGenerator,
+                OnRetry = args => OnRetryCallbackAsync(args, token)
+            };
+
+            var retryResilienceStrategy = new ResiliencePipelineBuilder<PhaseOutcome>()
+                .AddRetry(retryOptions)
+                .Build();
+            var metaInfoResult = new MetaInfoResult();
+            foreach (var phase in _configPhases)
+            {
+                var phaseOutcome = await retryResilienceStrategy.ExecuteAsync<PhaseOutcome>(async token =>
+                {
+                    /// Returning an operation failure error if the PhaseId
+                    /// is null or white space.
+                    if (string.IsNullOrWhiteSpace(phase.PhaseId))
+                    {
+                        return new(phase.PhaseId, ErrorType.Invalid, ""Invalid Phase ID."");
+                    }
+
+                    double lowLoadCurrent = -1, nearOverloadCurrent = -1, overLoadCurrent = -1;
+                    using var connection = new SshClient(_ipAddress, _username, _password);
+                    Command command = new GetPhLowLoadCommand(connection, phase.PhaseId);
+                    var rawResponse = await command.ExecuteAsync(token, _logger);
+                    var processor = new ResponseProcessor();
+                    var response = processor.Execute(rawResponse);
+                    /// Returning an operation invalid error if the operation
+                    /// to fetch metadata. The operation is failed due to parameter
+                    /// error.
+                    if (response.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value != ""Success"")
+                    {
+                        return new(phase.PhaseId, ErrorType.Invalid, operationState.Value);
+                    }
+
+                    /// We are using the ""String"" TokenType as key for the Phase properties
+                    /// because each response contains only one value, we can use the value
+                    /// for parsing it as double and set the parsed outcome for respective
+                    /// property of the phase.
+                    _ = (response.TryGetValue(TokenType.String, out var lowLoad) && double.TryParse(lowLoad.Value[..^1], out lowLoadCurrent));
+
+                    command = new GetPhNearOverCommand(connection, phase.PhaseId);
+                    rawResponse = await command.ExecuteAsync(token, _logger);
+                    response = processor.Execute(rawResponse);
+                    if (response.TryGetValue(TokenType.ErrorResponse, out operationState) && operationState.Value != ""Success"")
+                    {
+                        return new(phase.PhaseId, ErrorType.Invalid, operationState.Value);
+                    }
+                    _ = (response.TryGetValue(TokenType.String, out var nearOver) && double.TryParse(nearOver.Value[..^1], out nearOverloadCurrent));
+
+                    command = new GetPhOverLoadCommand(connection, phase.PhaseId);
+                    rawResponse = await command.ExecuteAsync(token, _logger);
+                    response = processor.Execute(rawResponse);
+                    if (response.TryGetValue(TokenType.ErrorResponse, out operationState) && operationState.Value != ""Success"")
+                    {
+                        return new(phase.PhaseId, ErrorType.Invalid, operationState.Value);
+                    }
+                    _ = (response.TryGetValue(TokenType.String, out var overLoad) && double.TryParse(overLoad.Value[..^1], out overLoadCurrent));
+
+                    if (lowLoadCurrent == -1 || nearOverloadCurrent == -1 || overLoadCurrent == -1)
+                    {
+                        return new(phase.PhaseId, ErrorType.Failure, ""Error occurred while fetching metaInfo associated with a phase."");
+                    }
+
+                    return new(phase.PhaseId, lowLoadCurrent, nearOverloadCurrent, overLoadCurrent);
+                }, token);
+
+                if (phaseOutcome.IsSuccess)
+                {
+                    metaInfoResult.Success.Add(phaseOutcome);
+                }
+                else
+                {
+                    metaInfoResult.Error.Add(phaseOutcome);
+                }
+            }
+
+            return metaInfoResult;
+        }
+
+        private async ValueTask OnRetryCallbackAsync(OnRetryArguments<PhaseOutcome> arguments, CancellationToken token)
+        {
+            var exception = arguments.Outcome.Exception;
+            var description = arguments.Outcome.Result?.Description;
+            if (exception is SocketException || exception is TimeoutException || exception is SshAuthenticationException)
+            {
+                await PingAsync(exception, token);
+            }
+            else if (exception is not null)
+            {
+                _logger.LogError(exception.Message);
+                if (exception is ParseException)
+                {
+                    _updateExtensionStatus(new(Resource.StatusConfigurationInvalidMessage));
+                }
+                else
+                {
+                    _updateExtensionStatus(new(exception.Message));
+                }
+            }
+            else if (description is not null)
+            {
+                if (description == ""Parameter Error"")
+                {
+                    _updateExtensionStatus(new(Resource.StatusConfigurationInvalidMessage));
+                }
+                else
+                {
+                    _updateExtensionStatus(new(description));
+                }
+            }
+        }
+
+        /// <summary>
+        /// PingAsync makes ping request to the device,
+        /// based on te response of ping request, Extension
+        /// Status Message is updated accordingly.
+        /// </summary>
+        /// <param name=""exception""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        private async Task PingAsync(Exception exception, CancellationToken token)
+        {
+            var icmpClient = new IcmpStatusClient();
+            var icmpStatus = await icmpClient.ConnectAsync(_ipAddress, token);
+            if (icmpStatus)
+            {
+                if (exception is SshAuthenticationException)
+                {
+                    _updateExtensionStatus(new(Resource.StatusDeviceActiveButInvalidCredentialsMessage));
+                }
+                else
+                {
+                    _updateExtensionStatus(new(Resource.StatusDeviceNotAccessibleMessage));
+                }
+            }
+            else
+            {
+                _updateExtensionStatus(new(Resource.StatusTimeoutExceptionMessage));
+            }
+        }
+
+        private ValueTask<TimeSpan?> RetryDelayGenerator(RetryDelayGeneratorArguments<PhaseOutcome> args)
+        {
+            if (args.Outcome.Exception is SocketException || args.Outcome.Exception is IOException || args.Outcome.Exception is TimeoutException)
+            {
+                return new(TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber)));
+            }
+            else
+            {
+                return new(TimeSpan.FromSeconds(0.5));
+            }
+        }
+    }
+}",fetches multiple values
+4,APCPDU,DeviceAPIOutcome.cs,SSH,RenciSSH.NET,"namespace CDC.Plugin.APCPDU.Communication
+{
+    public class DeviceApiOutcome
+    {
+        public bool Status { get; set; }
+        public string? Description { get; set; }
+        public OutcomeReason OutcomeReason { get; set; }
+        public IReadOnlyDictionary<string, string>? Result { get; set; }
+    }
+}",Result pattern
+5,APCPDU,DeviceControlApiClient.cs,SSH,RenciSSH.NET,"using CDC.Core;
+using CDC.Core.Logging;
+using CDC.Engine;
+using CDC.Engine.WorkItems;
+using CDC.Plugin.APCPDU.Communication.Commands;
+using CDC.Plugin.APCPDU.Parsers.Definitions;
+using CDC.Plugin.APCPDU.Properties;
+using Renci.SshNet;
+using Renci.SshNet.Common;
+using System.Net.Sockets;
+
+namespace CDC.Plugin.APCPDU.Communication
+{
+    public class DeviceControlApiClient
+    {
+        private readonly string _ipAddress;
+        private readonly string _username;
+        private readonly string _password;
+        private readonly IEngineHost _host;
+        private readonly IEngineLogger _logger;
+        private readonly ResponseProcessor _processor = new();
+
+        public DeviceControlApiClient(IEngineHost host, string ipAddress, string username, string password, IEngineLogger logger)
+        {
+            _host = host;
+            _ipAddress = ipAddress;
+            _username = username;
+            _password = password;
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// Maps the TokenTypes with their corresponding OutletId,
+        /// this map is used for adding the outletState to the results
+        /// of DeviceApiOutcome.
+        /// </summary>
+        private readonly IReadOnlyDictionary<TokenType, string> TokenTypeOutletMap = new Dictionary<TokenType, string>()
+        {
+            { TokenType.OutletStatusOne, ""1"" },
+            { TokenType.OutletStatusTwo, ""2"" },
+            { TokenType.OutletStatusThree, ""3"" },
+            { TokenType.OutletStatusFour, ""4"" },
+            { TokenType.OutletStatusFive, ""5"" },
+            { TokenType.OutletStatusSix, ""6"" },
+            { TokenType.OutletStatusSeven, ""7"" },
+            { TokenType.OutletStatusEight, ""8"" }
+        };
+
+        /// <summary>
+        /// FetchAllOutletStatesAsync is used to fetch status of all the outlets.
+        /// </summary>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome> FetchAsync(CancellationToken token)
+        {
+            var result = new DeviceApiOutcome();
+            try
+            {
+                var connection = new SshClient(_ipAddress, _username, _password);
+                connection.ConnectionInfo.Timeout = TimeSpan.FromSeconds(10);
+                var command = new GetOlStatusCommand(connection);
+                var outletStateResult = new Dictionary<string, string>();
+                var rawResponse = await command.ExecuteAsync(token, _logger);
+                var response = _processor.Execute(rawResponse);
+                if (response.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value == ""Success"")
+                {
+                    result.Status = true;
+                    result.Description = operationState.Value;
+                    result.OutcomeReason = OutcomeReason.Success;
+                    foreach (var element in TokenTypeOutletMap)
+                    {
+                        if (response.TryGetValue(element.Key, out var outletState))
+                        {
+                            outletStateResult.TryAdd(element.Value, outletState.Value);
+                        }
+                    }
+                    result.Result = outletStateResult;
+
+                    return result;
+                }
+                result.Status = false;
+
+                /// Reason is set to ""Failed"" at the time when the device responds with en Error code.
+                /// The description is set to the parsed value of ErrorResponse TokenType from the
+                /// response obtained from the device after performing the command.
+                result.OutcomeReason = OutcomeReason.Failed;
+                if (operationState is not null)
+                {
+                    result.Description = operationState.Value;
+                }
+                return result;
+            }
+            catch (SshAuthenticationException)
+            {
+                result.Status = false;
+                result.Description = Resource.InvalidCredentialsMessage;
+                result.OutcomeReason = OutcomeReason.SshAuthenticationException;
+                return result;
+            }
+            catch (SshConnectionException)
+            {
+                result.Status = false;
+                result.Description = Resource.StatusTimeoutExceptionMessage;
+                result.OutcomeReason = OutcomeReason.SshConnectionException;
+                return result;
+            }
+            catch (TimeoutException)
+            {
+                result.Status = false;
+                result.Description = Resource.StatusTimeoutExceptionMessage;
+                result.OutcomeReason = OutcomeReason.SshConnectionException;
+                return result;
+            }
+            catch (SocketException)
+            {
+                result.Status = false;
+                result.Description = Resource.StatusTimeoutExceptionMessage;
+                result.OutcomeReason = OutcomeReason.SshConnectionException;
+                return result;
+            }
+            catch (SshOperationTimeoutException)
+            {
+                result.Status = false;
+                result.Description = Resource.StatusTimeoutExceptionMessage;
+                result.OutcomeReason = OutcomeReason.SshOperationTimeoutException;
+                return result;
+            }
+            catch (TaskCanceledException) { }
+            catch (OperationCanceledException) { }
+
+            return result; ;
+        }
+
+        /// <summary>
+        /// TurnOutletOffAsync is used to turn off the provided outlet.
+        /// </summary>
+        /// <param name=""outletId""></param>
+        /// <param name=""propertyId""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome> TurnOutletOffAsync(string outletId, ProcessPropertyIdentifier propertyId, CancellationToken token)
+        {
+            try
+            {
+                var connection = new SshClient(_ipAddress, _username, _password);
+                connection.ConnectionInfo.Timeout = TimeSpan.FromSeconds(10);
+                var command = new SetOlOffCommand(connection, outletId);
+                var rawResponse = await command.ExecuteAsync(token, _logger);
+                var response = _processor.Execute(rawResponse);
+
+                if (response.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value == ""Success"")
+                {
+                    var workItem = _host.WorkItemManager.Create<ProcessObjectInteractionWorkItem>(_logger);
+                    workItem.AddCurrentValue(propertyId, false, CDC.Engine.PDB.ValueQuality.Good);
+                    await _host.Execute(workItem);
+                    return new()
+                    {
+                        Status = true,
+                        Description = operationState.Value,
+                        OutcomeReason = OutcomeReason.Success
+                    };
+                }
+
+                return new()
+                {
+                    Status = false,
+                    OutcomeReason = OutcomeReason.Failed,
+                    Description = operationState?.Value
+                };
+            }
+            catch (SshAuthenticationException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.InvalidCredentialsMessage,
+                    OutcomeReason = OutcomeReason.SshAuthenticationException
+                };
+            }
+            catch (SshConnectionException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshConnectionException
+                };
+            }
+            catch (TimeoutException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshConnectionException
+                };
+            }
+            catch (SocketException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshConnectionException
+                };
+            }
+            catch (SshOperationTimeoutException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshOperationTimeoutException
+                };
+            }
+            catch (TaskCanceledException) { }
+            catch (OperationCanceledException) { }
+
+            return new()
+            {
+                Status = false,
+                OutcomeReason = OutcomeReason.Failed
+            };
+        }
+
+        /// <summary>
+        /// TurnOutletOnAsync is used to turn on the provided outlet.
+        /// </summary>
+        /// <param name=""outletId""></param>
+        /// <param name=""propertyId""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome> TurnOutletOnAsync(string outletId, ProcessPropertyIdentifier propertyId, CancellationToken token)
+        {
+            try
+            {
+                var connection = new SshClient(_ipAddress, _username, _password);
+                connection.ConnectionInfo.Timeout = TimeSpan.FromSeconds(10);
+                var command = new SetOlOnCommand(connection, outletId);
+                var rawResponse = await command.ExecuteAsync(token, _logger);
+                var response = _processor.Execute(rawResponse);
+
+                if (response.TryGetValue(TokenType.ErrorResponse, out var operationState) && operationState.Value == ""Success"")
+                {
+                    var workItem = _host.WorkItemManager.Create<ProcessObjectInteractionWorkItem>(_logger);
+                    workItem.AddCurrentValue(propertyId, true, CDC.Engine.PDB.ValueQuality.Good);
+                    await _host.Execute(workItem);
+                    return new()
+                    {
+                        Status = true,
+                        Description = operationState.Value,
+                        OutcomeReason = OutcomeReason.Success
+                    };
+                }
+
+                return new()
+                {
+                    Status = false,
+                    OutcomeReason = OutcomeReason.Failed,
+                    Description = operationState?.Value
+                };
+            }
+            catch (SshException exception) when (exception is SshConnectionException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.InvalidCredentialsMessage,
+                    OutcomeReason = OutcomeReason.SshAuthenticationException
+                };
+            }
+            catch (SshConnectionException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshConnectionException
+                };
+            }
+            catch (TimeoutException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshConnectionException
+                };
+            }
+            catch (SocketException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshConnectionException
+                };
+            }
+            catch (SshOperationTimeoutException)
+            {
+                return new()
+                {
+                    Status = false,
+                    Description = Resource.StatusTimeoutExceptionMessage,
+                    OutcomeReason = OutcomeReason.SshOperationTimeoutException
+                };
+            }
+            catch (TaskCanceledException) { }
+            catch (OperationCanceledException) { }
+
+            return new()
+            {
+                Status = false,
+                OutcomeReason = OutcomeReason.Failed
+            };
+        }
+    }
+}",performs control operation
+6,ExtronXTP,Command.cs,TCP,SuperSimpleTCP,"using Polly;
+using Polly.Retry;
+using SuperSimpleTcp;
+using System.Text;
+
+namespace CDC.Plugin.ExtronXTP.Communication
+{
+    public abstract class Command
+    {
+        protected abstract string Message { get; }
+
+        public virtual async Task<string> ExecuteAsync(SimpleTcpClient connection, CancellationToken token)
+        {
+            var handler = new PredicateBuilder().Handle<ApplicationException>();
+
+            var retryOptions = new RetryStrategyOptions()
+            {
+                ShouldHandle = handler,
+                MaxRetryAttempts = 5,
+                DelayGenerator = args => new(TimeSpan.FromSeconds(0.5))
+            };
+
+            var resiliencePipeline = new ResiliencePipelineBuilder().AddRetry(retryOptions).Build();
+
+            var response = await resiliencePipeline.ExecuteAsync(async t =>
+            {
+                t.ThrowIfCancellationRequested();
+
+                var tcs = new TaskCompletionSource<string>();
+
+                void dataRecievedHandler(object? sender, DataReceivedEventArgs e)
+                {
+                    connection.Events.DataReceived -= dataRecievedHandler;
+
+                    var received = Encoding.ASCII.GetString(e.Data);
+
+                    /// An error response from the device begins with the letter 'E' and
+                    /// is suffixed by a numeric error code. For example, the response for
+                    /// out of range value is E13.
+                    ///
+                    /// Refer to the Matrix Switcher Error responses section of the manual
+                    /// to look up all possible error responses.
+                    if (received.StartsWith(""E""))
+                    {
+                        tcs.SetException(new ApplicationException($""Incorrect response obtained""));
+                        return;
+                    }
+
+                    tcs.SetResult(received);
+                }
+
+                connection.Events.DataReceived += dataRecievedHandler;
+                connection.Send(Encoding.ASCII.GetBytes(Message));
+
+                return await tcs.Task;
+            }, token);
+
+            return response;
+        }
+    }
+}","sends command to the device, retries 5 times at the time of failure"
+7,ExtronXTP,DeviceInfoApiClient.cs,TCP,SuperSimpleTCP,"using CDC.Core.Logging;
+using CDC.Engine.WorkItems;
+using CDC.Plugin.ExtronXTP.Engine;
+using CDC.Plugin.ExtronXTP.Extensions.Threading;
+using SuperSimpleTcp;
+using System.Net.Sockets;
+
+namespace CDC.Plugin.ExtronXTP.Communication
+{
+    public class DeviceInfoApiClient
+    {
+        private readonly XTPEngine _engine;
+        private readonly ProcessObjectInteractionWorkItem _workUnit;
+        private readonly IEngineLogger _logger;
+        private SimpleTcpClient? _connection;
+
+        public DeviceInfoApiClient(XTPEngine engine, ProcessObjectInteractionWorkItem workUnit)
+        {
+            _engine = engine;
+            _workUnit = workUnit;
+            _logger = _engine.GetLogger();
+        }
+
+        /// <summary>
+        /// Executes a batch of commands to query the device.
+        /// </summary>
+        /// <param name=""token"">Token to cancel the execution</param>
+        /// <returns>An awaitable task.</returns>
+        public async Task FetchAsync(CancellationToken token)
+        {
+            try
+            {
+                /// Attempt to open a connection to the device
+                var cts = token.CreateTimeBoundLinkedTokenSource(5000);
+                await ConnectAsync(cts.Token);
+
+                Command command;
+                string rawResponse;
+                var deviceInfo = new DeviceInfo(_engine.Configuration.NumberOfPorts);
+
+                /// Query the device parameters from here onwards. Allow
+                /// up to 30 seconds to query all required information.
+                cts = token.CreateTimeBoundLinkedTokenSource(TimeSpan.FromSeconds(30));
+                try
+                {
+                    command = new GetHDCPStatusCommand();
+                    rawResponse = await command.ExecuteAsync(_connection!, cts.Token);
+                    HDCPStatusResponse.Parse(rawResponse, in deviceInfo);
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""HDCP Status"");
+                }
+
+                try
+                {
+                    command = new GetInputSyncCommand();
+                    rawResponse = await command.ExecuteAsync(_connection!, cts.Token);
+                    InputSyncResponse.Parse(rawResponse, in deviceInfo);
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Input Sync"");
+                }
+
+                try
+                {
+                    command = new GetAudioRoutingSelectionCommand();
+                    rawResponse = await command.ExecuteAsync(_connection!, cts.Token);
+                    AudioRoutingSelectionResponse.Parse(rawResponse, in deviceInfo);
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Audio Routing Selection"");
+                }
+
+                try
+                {
+                    command = new GetInputInsertionCommand();
+                    rawResponse = await command.ExecuteAsync(_connection!, cts.Token);
+                    InputInsertionResponse.Parse(rawResponse, in deviceInfo);
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Input Insertion"");
+                }
+
+                try
+                {
+                    command = new GetPowerCommand();
+                    rawResponse = await command.ExecuteAsync(_connection!, cts.Token);
+                    deviceInfo.Power = $""{(rawResponse[0] - 48) * 0.1} Watt"";
+                    deviceInfo.PowerSupplyStatus = rawResponse[2] == '0';
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Power"");
+                }
+
+                try
+                {
+                    command = new GetSerialPortParameterCommand();
+                    rawResponse = await command.ExecuteAsync(_connection!, cts.Token);
+                    var responseArray = rawResponse.Split(',');
+                    deviceInfo.BaudRate = int.TryParse(responseArray[0], out var baudRate) ? baudRate : 0;
+                    deviceInfo.Parity = responseArray[1][0];
+                    deviceInfo.DataBits = int.TryParse(responseArray[2], out var dataBits) ? dataBits : 0;
+                    deviceInfo.StopBits = int.TryParse(responseArray[3], out var stopBits) ? stopBits : 0;
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Serial Port Parameter"");
+                }
+
+                try
+                {
+                    command = new GetPortTimeoutCommand();
+                    rawResponse = await command.ExecuteAsync(_connection!, cts.Token);
+                    deviceInfo.PortTimeOut = int.TryParse(rawResponse, out var timeout) ? timeout : 0;
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Port Timeout"");
+                }
+
+                try
+                {
+                    for (var i = 1; i <= _engine.Configuration.NumberOfPorts; i++)
+                    {
+                        /// The GetPortCommand does not use a time-bound cancellation
+                        /// source because it executes several sub-commands within
+                        /// its ExecuteAsync() method.
+                        ///
+                        /// It creates a time-bound cancellation token that is linked
+                        /// to the one passed to the method invocation below.
+                        command = new GetPortCommand(i, deviceInfo, _logger);
+                        await command.ExecuteAsync(_connection!, token);
+                    }
+                }
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Port Properties"");
+                }
+
+                deviceInfo.AssignData(_engine, _workUnit);
+            }
+            finally
+            {
+                /// Disconnect from the device.
+                var cts = token.CreateTimeBoundLinkedTokenSource(5000);
+                await DisconnectAsync(cts.Token);
+            }
+        }
+
+        /// <summary>
+        /// This method wraps the EAP implementation of the SimpleTcpClient
+        /// class into a TAP structure.
+        /// </summary>
+        /// <param name=""token"">Token to cancel the execution</param>
+        /// <returns>An awaitable task.</returns>
+        private Task ConnectAsync(CancellationToken token)
+        {
+            var connectTask = Task.Run(async () =>
+            {
+                _connection = new SimpleTcpClient(_engine.Configuration.IPAddress, 23);
+                var tcs = new TaskCompletionSource();
+
+                void connectedHandler(object? sender, ConnectionEventArgs e)
+                {
+                    _connection.Events.Connected -= connectedHandler;
+                }
+
+                /// A copyright banner is received from the device to indicate
+                /// that a connection has been successfully established. This
+                /// banner inteferes with the rest of the commands if it is
+                /// ignored. This method waits to receive this message from the
+                /// device after the connection is established, and only then
+                /// does it return.
+                void dataReceivedHandler(object? sender, DataReceivedEventArgs e)
+                {
+                    _connection.Events.DataReceived -= dataReceivedHandler;
+                    tcs.SetResult();
+                }
+
+                _connection.Events.Connected += connectedHandler;
+                _connection.Events.DataReceived += dataReceivedHandler;
+                _connection.Connect();
+
+                await tcs.Task;
+            }, token);
+
+            return connectTask;
+        }
+
+        /// <summary>
+        /// This method wraps the EAP implementation of the SimpleTcpClient
+        /// class into a TAP structure.
+        /// </summary>
+        /// <param name=""token"">Token to cancel the execution</param>
+        /// <returns>An awaitable task.</returns>
+        private Task DisconnectAsync(CancellationToken token)
+        {
+            if (_connection == null || _connection.IsConnected)
+            {
+                return Task.CompletedTask;
+            }
+
+            var disconnectTask = Task.Run(() =>
+            {
+                var tcs = new TaskCompletionSource();
+                void disconnectedHandler(object? sender, ConnectionEventArgs args)
+                {
+                    _connection.Events.Disconnected -= disconnectedHandler;
+                    tcs.SetResult();
+                }
+
+                _connection.Events.Disconnected += disconnectedHandler;
+                _connection.Dispose();
+
+                return tcs.Task;
+            }, token);
+
+            return disconnectTask;
+        }
+
+        private void LogErrorMessage(Exception exception, string propertyName)
+        {
+            _logger.LogError(""Runtime Error"", $""Exception occurred while fetching data for the {propertyName} from the device."", exception);
+        }
+    }
+}","makes connection for batch of command, recieves welcome message at time of connection establishment"
+8,ExtronXTP,MetaInfoApiClient.cs,TCP,SuperSimpleTCP,"using CDC.Plugin.ExtronXTP.Engine;
+using CDC.Plugin.ExtronXTP.Extensions.Threading;
+using CDC.Plugin.ExtronXTP.Properties;
+using Polly;
+using Polly.Retry;
+using SuperSimpleTcp;
+using System.Net.Sockets;
+
+namespace CDC.Plugin.ExtronXTP.Communication
+{
+    public class MetaInfoApiClient
+    {
+        private readonly string _ipAddress;
+        private SimpleTcpClient? _connection;
+        private readonly Action<UpdateExtensionStatusEventArguments> _updateExtensionStatus;
+
+        public MetaInfoApiClient(string ipAddress, Action<UpdateExtensionStatusEventArguments> updateExtensionStatus)
+        {
+            _ipAddress = ipAddress;
+            _updateExtensionStatus = updateExtensionStatus;
+        }
+
+        /// <summary>
+        /// Queries the device for the number of available
+        /// ports. This number is fundamental to the operation
+        /// of this plugin as it determines the number of
+        /// properties that have to be created in the engine
+        /// at runtime, and the number of queries that must
+        /// be executed to retrieve data to populate those
+        /// properties.
+        /// </summary>
+        /// <param name=""token"">Token to cancel the execution</param>
+        /// <returns>An awaitable task.</returns>
+        public async Task<MetaInfoOutcome> FetchAsync(CancellationToken token)
+        {
+            var shouldHandleRetry = new PredicateBuilder<MetaInfoOutcome>()
+                .Handle<Exception>()
+                .HandleResult(result => !result.IsSuccess);
+
+            var retryOptions = new RetryStrategyOptions<MetaInfoOutcome>()
+            {
+                ShouldHandle = shouldHandleRetry,
+                MaxRetryAttempts = int.MaxValue,
+                DelayGenerator = RetryDelayGenerator,
+                OnRetry = args => OnRetryCallbackAsync(args, token)
+            };
+
+            var retryResilienceStrategy = new ResiliencePipelineBuilder<MetaInfoOutcome>()
+                .AddRetry(retryOptions)
+                .Build();
+
+            var numberOfPorts = await retryResilienceStrategy.ExecuteAsync<MetaInfoOutcome>(async t =>
+            {
+                var cts = token.CreateTimeBoundLinkedTokenSource(5000);
+                await ConnectAsync(cts.Token);
+
+                var command = new GetHDCPStatusCommand();
+                /// The _connection field should always contain a valid
+                /// reference by the time it reaches this line.
+                var response = await command.ExecuteAsync(_connection!, cts.Token);
+
+                cts = token.CreateTimeBoundLinkedTokenSource(5000);
+                await DisconnectAsync(cts.Token);
+
+                return new(response.Length - 2);
+            }, token);
+
+            return numberOfPorts;
+        }
+
+        private async ValueTask OnRetryCallbackAsync(OnRetryArguments<MetaInfoOutcome> args, CancellationToken token)
+        {
+            if (args.Outcome.Exception is TimeoutException || args.Outcome.Exception is SocketException)
+            {
+                await PingAsync(token);
+            }
+            else if (args.Outcome.Exception is not null)
+            {
+                _updateExtensionStatus(new(args.Outcome.Exception.Message));
+            }
+            else if (args.Outcome.Result?.Description is not null)
+            {
+                _updateExtensionStatus(new(args.Outcome.Result.Description));
+            }
+            await DisconnectAsync(token);
+        }
+
+        /// <summary>
+        /// PingAsync makes ping request to the device,
+        /// based on the response of the ping request
+        /// the UpdateExtensionStatus is triggered.
+        /// </summary>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        private async Task PingAsync(CancellationToken token)
+        {
+            var icmpClient = new IcmpClient();
+            var icmpStatus = await icmpClient.ConnectAsync(_ipAddress, token);
+            if (icmpStatus)
+            {
+                _updateExtensionStatus(new(Resource.StatusDeviceNotAccessibleMessage));
+            }
+            else
+            {
+                _updateExtensionStatus(new(Resource.StatusConnectionTimedoutMessage));
+            }
+        }
+
+        /// <summary>
+        /// Calculates the delay between consecutive attempts to query
+        /// the device for information. The function follows an
+        /// exponential back-off strategy in case it encounters
+        /// network-related problems, or a fixed value strategy in
+        /// other cases.
+        /// </summary>
+        /// <param name=""args"">An instance of <see cref=""RetryDelayGeneratorArguments{TResult}""/>.</param>
+        /// <returns>An awaitable task.</returns>
+        private static ValueTask<TimeSpan?> RetryDelayGenerator(RetryDelayGeneratorArguments<MetaInfoOutcome> args)
+        {
+            if (args.Outcome.Exception is SocketException || args.Outcome.Exception is IOException || args.Outcome.Exception is TimeoutException)
+            {
+                return new(TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber)));
+            }
+            else
+            {
+                return new(TimeSpan.FromSeconds(0.5));
+            }
+        }
+
+        /// <summary>
+        /// This method wraps the EAP implementation of the SimpleTcpClient
+        /// class into a TAP structure.
+        /// </summary>
+        /// <param name=""token"">Token to cancel the execution</param>
+        /// <returns>An awaitable task.</returns>
+        private Task ConnectAsync(CancellationToken token)
+        {
+            if (_connection != null && _connection.IsConnected)
+            {
+                return Task.CompletedTask;
+            }
+
+            var connectTask = Task.Run(async () =>
+            {
+                _connection = new SimpleTcpClient(_ipAddress, 23);
+                var tcs = new TaskCompletionSource();
+
+                void connectedHandler(object? sender, ConnectionEventArgs e)
+                {
+                    _connection.Events.Connected -= connectedHandler;
+                }
+
+                /// A copyright banner is received from the device to indicate
+                /// that a connection has been successfully established. This
+                /// banner inteferes with the rest of the commands if it is
+                /// ignored. This method waits to receive this message from the
+                /// device after the connection is established, and only then
+                /// does it return.
+                void dataReceivedHandler(object? sender, DataReceivedEventArgs e)
+                {
+                    _connection.Events.DataReceived -= dataReceivedHandler;
+                    tcs.SetResult();
+                }
+
+                _connection.Events.Connected += connectedHandler;
+                _connection.Events.DataReceived += dataReceivedHandler;
+                _connection.Connect();
+
+                await tcs.Task;
+            }, token);
+
+            return connectTask;
+        }
+
+        /// <summary>
+        /// This method wraps the EAP implementation of the SimpleTcpClient
+        /// class into a TAP structure.
+        /// </summary>
+        /// <param name=""token"">Token to cancel the execution</param>
+        /// <returns>An awaitable task.</returns>
+        private Task DisconnectAsync(CancellationToken token)
+        {
+            if (_connection == null || !_connection.IsConnected)
+            {
+                return Task.CompletedTask;
+            }
+
+            var disconnectTask = Task.Run(() =>
+            {
+                var tcs = new TaskCompletionSource();
+                void disconnectedHandler(object? sender, ConnectionEventArgs args)
+                {
+                    _connection.Events.Disconnected -= disconnectedHandler;
+                    tcs.SetResult();
+                }
+
+                _connection.Events.Disconnected += disconnectedHandler;
+                _connection.Disconnect();
+
+                return tcs.Task;
+            }, token);
+
+            return disconnectTask;
+        }
+    }
+}",fetches single value from the device
+9,ExtronXTP,MetaInfoOutcpme.cs,TCP,SuperSimpleTCP,"namespace CDC.Plugin.ExtronXTP.Communication
+{
+    public class MetaInfoOutcome
+    {
+        /// <summary>
+        /// IsSuccess specifies whether the operation to fetch MetaData is
+        /// successful or not.
+        /// </summary>
+        public bool IsSuccess { get; set; }
+
+        /// <summary>
+        /// Description stores the description which specifies the cause
+        /// of operation failure.
+        /// </summary>
+        public string? Description { get; set; }
+
+        /// <summary>
+        /// Stores the number of ports available with the Extron device.
+        /// </summary>
+        public int NumberOfPorts { get; set; }
+
+        /// <summary>
+        /// Creates an instance of MetaInfoOutcome if the operation of
+        /// fetching meta data fails.
+        /// </summary>
+        /// <param name=""description""></param>
+        public MetaInfoOutcome(string description)
+        {
+            IsSuccess = false;
+            Description = description;
+        }
+
+        /// <summary>
+        /// Creates an instance of MetaInfoOutcome if the operation of
+        /// fetching meta data succeeds.
+        /// </summary>
+        /// <param name=""numberOfPorts""></param>
+        public MetaInfoOutcome(int numberOfPorts)
+        {
+            IsSuccess = true;
+            NumberOfPorts = numberOfPorts;
+        }
+    }
+}",result pattern for metainfoapiclient
+10,SamsungMDC,Command.cs,TCP,System.Net.Socket,"using CDC.Core.Logging;
+using Polly;
+using Polly.Retry;
+using System.Net.Sockets;
+
+namespace CDC.Plugin.SamsungMDC.Communication
+{
+    public abstract class Command
+    {
+        protected abstract MemoryStream Message { get; }
+
+        public async Task<IList<byte>> ExecuteAsync(Socket connection, IEngineLogger logger, CancellationToken token)
+        {
+            var handler = new PredicateBuilder()
+                .Handle<Exception>(exception => !token.IsCancellationRequested);
+
+            var retryOptions = new RetryStrategyOptions
+            {
+                ShouldHandle = handler,
+                MaxRetryAttempts = 5,
+                OnRetry = args => OnRetryExecute(args, logger),
+                DelayGenerator = RetryDelayGenerator
+            };
+
+            var resiliencePipeline = new ResiliencePipelineBuilder().AddRetry(retryOptions).Build();
+
+            return await resiliencePipeline.ExecuteAsync(async t =>
+            {
+                t.ThrowIfCancellationRequested();
+
+                var responseBuffer = new List<byte>();
+
+                var outgoing = Message.ToArray();
+                outgoing[^1] = CalculateMessageCheckSum(outgoing);
+                var length = await connection.SendAsync(outgoing, SocketFlags.None, token);
+                do
+                {
+                    var incoming = new byte[32];
+                    length = await connection.ReceiveAsync(incoming, SocketFlags.None, token);
+                    for (var i = 0; i < length; i++)
+                    {
+                        responseBuffer.Add(incoming[i]);
+                    }
+
+                    if (responseBuffer[^1] == CalculateMessageCheckSum(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(responseBuffer)))
+                    {
+                        break;
+                    }
+                } while (true);
+                return responseBuffer;
+            }, token);
+        }
+
+        private static ValueTask OnRetryExecute(OnRetryArguments<object> args, IEngineLogger logger)
+        {
+            logger.LogError(""Runtime Error"", $""Exception occurred while querying the device."", args.Outcome.Exception);
+            return new();
+        }
+
+        private static ValueTask<TimeSpan?> RetryDelayGenerator(RetryDelayGeneratorArguments<object> arguments)
+        {
+            if (arguments.Outcome.Exception is TaskCanceledException || arguments.Outcome.Exception is OperationCanceledException)
+            {
+                return new(TimeSpan.Zero);
+            }
+
+            var delay = Math.Min(Math.Pow(arguments.AttemptNumber, 2) * 0.08, 600);
+            return new(TimeSpan.FromSeconds(delay));
+        }
+
+        private static byte CalculateMessageCheckSum(Span<byte> data)
+        {
+            ArgumentNullException.ThrowIfNull(nameof(data));
+
+            var sum = (byte)0x00;
+            // The first and last element in the collection are ignored
+            // in the loop below because the first index has header and
+            // last index has checksum
+            for (var i = 1; i < data.Length - 1; i++)
+            {
+                sum += data[i];
+            }
+
+            sum = Truncate(sum);
+            return sum;
+        }
+
+        private static byte Truncate(int input) => (byte)(input & 0xFF);
+    }
+}",performs socket based communication where data is recieved over a stream and checksum is used for confirmation of complete response obtained.
+11,SamsungMDC,DeviceInfoApiClient.cs,TCP,System.Net.Socket,"using CDC.Core.Logging;
+using CDC.Engine.WorkItems;
+using CDC.Plugin.SamsungMDC.Engine;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+namespace CDC.Plugin.SamsungMDC.Communication
+{
+    public class DeviceInfoApiClientQMN : IDeviceInfoApiClient
+    {
+        private readonly SamsungEngine _engine;
+
+        private readonly ProcessObjectInteractionWorkItem _workUnit;
+
+        private readonly IEngineLogger _logger;
+
+        public DeviceInfoApiClientQMN(SamsungEngine engine, ProcessObjectInteractionWorkItem workItem)
+        {
+            _engine = engine;
+            _workUnit = workItem;
+            _logger = _engine.GetLogger();
+        }
+
+        public async Task FetchAsync(CancellationToken token)
+        {
+            var connection = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            var endPoint = new IPEndPoint(IPAddress.Parse(_engine.Configuration.IPAddress), 9001);
+            try
+            {
+                await connection.ConnectAsync(endPoint, token);
+
+                Command command;
+                IList<byte> response;
+                var deviceInfo = new DeviceInfoQMN();
+                try
+                {
+                    command = new GetPowerCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.Power = response[6] == 1;
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Power"");
+                }
+
+                try
+                {
+                    command = new GetVolumeCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.Volume = response[6];
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Volume"");
+                }
+
+                try
+                {
+                    command = new GetInputSourceControl((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.InputSource = response[4];
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Input Source"");
+                }
+
+                try
+                {
+                    command = new GetScreenSizeControlCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.ScreenSize = response[6];
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Screen Size Control"");
+                }
+
+                try
+                {
+                    command = new GetVideoWallModeCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.VideoWallMode = response[6] == 1;
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Video Wall Mode"");
+                }
+
+                try
+                {
+                    command = new GetSafetyLockCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.SafetyLock = response[6] == 1;
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Safety Lock"");
+                }
+
+                try
+                {
+                    command = new GetVideoWallOnCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.VideoWallOn = response[6] == 1;
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Video Wall On"");
+                }
+
+                try
+                {
+                    command = new GetVideoWallUserCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.VideoWallDivider = response[4];
+                    deviceInfo.VideoWallSerialNumber = response[5];
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Video Wall User"");
+                }
+
+                try
+                {
+                    command = new GetSerialNumberCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.SerialNumber = SerialNumberData(response);
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Serial Number"");
+                }
+
+                try
+                {
+                    command = new GetDisplayStatusCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.CurrentTemperature = (int)response[10];
+                    deviceInfo.LampError = response[6] == 1;
+                    deviceInfo.TemperatureError = response[7] == 1;
+                    deviceInfo.BrightSensorError = (response[8] == 1 ? ""No error"" : response[8] == 2 ? ""Normal"" : ""Error"");
+                    deviceInfo.NoSyncError = (response[9] == 1 ? ""Error"" : response[9] == 2 ? ""Invalid"" : ""Normal"");
+                    deviceInfo.FanError = (response[11] == 1 ? ""Error"" : response[11] == 2 ? ""Fan is not supported"" : ""Normal"");
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Display Status"");
+                }
+
+                try
+                {
+                    command = new GetModelCommand((byte)_engine.Configuration.DeviceId);
+                    response = await command.ExecuteAsync(connection, _logger, token);
+                    deviceInfo.Model = ((Model)response[7]).ToString();
+                    deviceInfo.Species = ((Species)response[6]).ToString();
+                    deviceInfo.SupportTv = response[8] == 1;
+                }
+                /// Catch the exception but do nothing; the property will remain null and will appear {BAD} on the UI
+                catch (Exception e)
+                when (e is not OperationCanceledException
+                && e is not TaskCanceledException
+                && e is not SocketException
+                && e is not TimeoutException)
+                {
+                    LogErrorMessage(e, ""Model"");
+                }
+
+                deviceInfo.WriteTo(_engine, _workUnit);
+            }
+            finally
+            {
+                await connection.DisconnectAsync(true, token);
+            }
+        }
+
+        // The array elements between the index 6 and index 19
+        // of the response array represents the Serial Number of
+        // the device.
+        // For example response array = [ 170, 255, 1, 20, 65, 11, 48, 55, 82, 89, 72, 67, 67, 75, 55, 48, 48, 48, 57, 52, 74, 0, 0, 0, 9]
+        // The Serial number of the device can be obtained using
+        //  the data elements betweeen the index 6 and 19.
+        private static string SerialNumberData(IList<byte> data) => Encoding.ASCII.GetString(data.ToArray()[6..20]);
+
+        private void LogErrorMessage(Exception exception, string propertyName)
+        {
+            _logger.LogError(""Runtime Error"", $""Exception occurred while fetching data for the {propertyName} from the device."", exception);
+        }
+    }
+}",performs socket based communication with one time connection establishment
+12,NovaStar LED Wall Controller,DeviceInfoApiClient.cs,Http,System.Net.Http,"using CDC.Core.Logging;
+using CDC.Engine.PDB;
+using CDC.Engine.WorkItems;
+using CDC.Plugin.NovaStarLEDWallController.Communication.Commands;
+using CDC.Plugin.NovaStarLEDWallController.Engine;
+using CDC.Plugin.NovaStarLEDWallController.Models;
+using CDC.Plugin.NovaStarLEDWallController.Models.ControlCommands;
+using CDC.Plugin.NovaStarLEDWallController.Properties;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using System.Net.Sockets;
+using System.Text.Json;
+
+namespace CDC.Plugin.NovaStarLEDWallController.Communication
+{
+    /// <summary>
+    /// Performs the control operation supported by the plugin.
+    /// </summary>
+    /// <param name=""engine"">Instance of the <see cref=""LEDWallControllerEngine""/></param>
+    /// <param name=""workItem"">Instance of the <see cref=""ProcessObjectInteractionWorkItem""/></param>
+    /// <param name=""logger"">Instance if <see cref=""IEngineLogger""/> performs logging operation.</param>
+    public class DeviceControlApiClient(LEDWallControllerEngine engine, ProcessObjectInteractionWorkItem workItem, IEngineLogger logger)
+    {
+        /// <summary>
+        /// Fetches the screen display parameters such as
+        /// brightness, color temperature, gamma from the
+        /// device.
+        /// </summary>
+        /// <param name=""ipAddress"">IP address of the device for communication</param>
+        /// <param name=""port"">Port at which the device listens</param>
+        /// <param name=""token"">Instance of <see cref=""CancellationToken""/> for cancelling asynchronous operation.</param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<DisplayParameters>> FetchScreenDisplayEffectParameterAsync(CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var command = new GetDisplayParametersCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, token: token);
+
+            return response;
+        }
+
+        /// <summary>
+        /// Fetches information regarding all the screens
+        /// from the device.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<ScreenInformation>> FetchScreenInformationAsync(CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var command = new GetScreenInformationCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, token: token);
+            return response;
+        }
+
+        /// <summary>
+        /// Updates the brightness of the screens
+        /// of the provided ids, with the provided
+        /// value.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""screenId""></param>
+        /// <param name=""brightness""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<object>> SetBrightnessAsync(string[] screenId, double brightness, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var requestBody = new SetBrightness(screenId, brightness);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var command = new SetBrightnessCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                workItem.AddCurrentValue(engine.Brightness?.Identifier, brightness, ValueQuality.Good);
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        /// <summary>
+        /// Updates the color temperature of the screens
+        /// of the provided ids, with the provided values.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""screenId""></param>
+        /// <param name=""colorTemperature""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<object>> SetColorTemperatureAsync(string[] screenId, int colorTemperature, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var requestBody = new SetColorTemperature(screenId, colorTemperature);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var command = new SetColorTemperatureCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                workItem.AddCurrentValue(engine.ColorTemperature?.Identifier, colorTemperature, ValueQuality.Good);
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        /// <summary>
+        /// Updates the gamma of the screens
+        /// of the provided ids, with the provided
+        /// values.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""screenId""></param>
+        /// <param name=""colorTemperature""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<object>> SetGammaAsync(string[] screenId, double gamma, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var requestBody = new SetGamma(screenId, gamma);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var command = new SetGammaCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                workItem.AddCurrentValue(engine.Gamma?.Identifier, gamma, ValueQuality.Good);
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        public async Task<DeviceApiOutcome<object>> SetDisplayStatusAsync(int?[] canvas, int status, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var command = new SetDisplayStatusCommand(client);
+            var requestBody = new SetDisplayStatus(status, canvas);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        public async Task<DeviceApiOutcome<T>> ExecuteCommandAsync<T>(Command<T> command, string ipAddress, int port, HttpContent? content = null, CancellationToken token = default)
+        {
+            try
+            {
+                var response = await command.ExecuteAsync(ipAddress, port, content, token);
+                if (response is null)
+                {
+                    return DeviceApiOutcome<T>.Failure($""Operation {nameof(command)} failed."");
+                }
+
+                return DeviceApiOutcome<T>.Success(response);
+            }
+            catch (JsonException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.JsonExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.JsonExceptionMessage);
+            }
+            catch (InvalidOperationException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.InvalidOperationExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.InvalidOperationExceptionMessage);
+            }
+            catch (ArgumentNullException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.RequestArgumentNullExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.RequestArgumentNullExceptionMessage);
+            }
+            catch (Exception ex) when (ex is SocketException || (ex is HttpRequestException && ex.InnerException is SocketException))
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.StatusNetworkErrorMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.StatusNetworkErrorMessage);
+            }
+            catch (TimeoutException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.StatusConnectionTimedoutMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.StatusConnectionTimedoutMessage);
+            }
+            catch (HttpRequestException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.HttpRequestExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.HttpRequestExceptionMessage);
+            }
+            catch (TaskCanceledException)
+            {
+                logger.LogError($""Operation to execute {nameof(command)} is canceled"");
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogError($""Operation to execute {nameof(command)} is canceled"");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($""Unexpected error occurred while executing {nameof(command)}"", ex.Message, ex);
+            }
+
+            return DeviceApiOutcome<T>.Failure($""Operation {nameof(command)} failed."");
+        }
+
+        /// <summary>
+        /// Creates an instance of HttpClient
+        /// with some provided configurations.
+        /// </summary>
+        /// <returns></returns>
+        private static HttpClient CreateHttpClient(int timeout)
+        {
+            var serviceCollection = new ServiceCollection();
+            _ = serviceCollection.AddHttpClient(Options.DefaultName, c => { })
+                .ConfigurePrimaryHttpMessageHandler(_ => new HttpClientHandler
+                {
+                    ClientCertificateOptions = ClientCertificateOption.Automatic,
+                    ServerCertificateCustomValidationCallback = (httpRequestMessage, cert, cetChain, policyErrors) => true
+                })
+                .ConfigureHttpClient(c =>
+                {
+                    c.DefaultRequestHeaders.Add(""Accept"", ""application/json"");
+                    c.Timeout = TimeSpan.FromSeconds(timeout);
+                });
+            var provider = serviceCollection.BuildServiceProvider();
+
+            var factory = provider.GetRequiredService<IHttpClientFactory>();
+
+            return factory.CreateClient();
+        }
+    }
+}",performs communication with the device using Http protocol. The class makes use of  Basic authorization.
+13,NovaStar LED Wall Controller,Command.cs,Http,System.Net.Http,"using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json;
+
+namespace CDC.Plugin.NovaStarLEDWallController.Communication.Commands
+{
+    /// <summary>
+    /// Sends the request to the device.
+    /// </summary>
+    /// <typeparam name=""T""></typeparam>
+    /// <param name=""client""></param>
+    public abstract class Command<T>(HttpClient client)
+    {
+        /// <summary>
+        /// The endpoint at which the request is
+        /// to be sent.
+        /// </summary>
+        protected abstract string Message { get; }
+
+        /// <summary>
+        /// The Http method of the request.
+        /// </summary>
+        protected abstract HttpMethod Method { get; }
+
+        /// <summary>
+        /// Sends the Message with corresponding
+        /// method to the ip address using HttpClient.
+        /// HttpContent is provided by control operations
+        /// where the body parameters are needed to
+        /// be sent to the device. The obtained response
+        /// is deserialized to the provided type ""T"".
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""content""></param>
+        /// <param name=""token""></param>
+        /// <exception cref=""ArgumentNullException""></exception>
+        /// <exception cref=""InvalidOperationException""></exception>
+        /// <exception cref=""HttpRequestException""></exception>
+        /// <exception cref=""JsonException""></exception>
+        /// <exception cref=""TaskCanceledException""></exception>
+        /// <returns></returns>
+        public async Task<T?> ExecuteAsync(string ipAddress, int port, HttpContent? content = null, CancellationToken token = default)
+        {
+            var uriBuilder = new UriBuilder
+            {
+                Host = ipAddress,
+                Port = port,
+                Path = Message
+            };
+            var request = new HttpRequestMessage(Method, uriBuilder.Uri);
+            request.Content = content;
+            if (request.Content != null)
+            {
+                request.Content.Headers.ContentType = new MediaTypeHeaderValue(""application/json"");
+            }
+            var rawResponse = await client.SendAsync(request, token);
+            var serialiserOptions = new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+            };
+            var response = await rawResponse.Content.ReadFromJsonAsync<T>(serialiserOptions, token);
+            return response;
+        }
+    }
+}","performs communication with the device using Http protocol. The class contains HttpMethod which specifies the type of operation is needed like fetching data or updating data. The class takes a generic parameter ""T"" which is used to transform the data obtained from the JSON data to this type ""T"" instance."
+14,NovaStar LED Wall Controller,DeviceControlApiClient.cs,Http,System.Net.Http,"using CDC.Core.Logging;
+using CDC.Engine.PDB;
+using CDC.Engine.WorkItems;
+using CDC.Plugin.NovaStarLEDWallController.Communication.Commands;
+using CDC.Plugin.NovaStarLEDWallController.Engine;
+using CDC.Plugin.NovaStarLEDWallController.Models;
+using CDC.Plugin.NovaStarLEDWallController.Models.ControlCommands;
+using CDC.Plugin.NovaStarLEDWallController.Properties;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using System.Net.Sockets;
+using System.Text.Json;
+
+namespace CDC.Plugin.NovaStarLEDWallController.Communication
+{
+    /// <summary>
+    /// Performs the control operation supported by the plugin.
+    /// </summary>
+    /// <param name=""engine"">Instance of the <see cref=""LEDWallControllerEngine""/></param>
+    /// <param name=""workItem"">Instance of the <see cref=""ProcessObjectInteractionWorkItem""/></param>
+    /// <param name=""logger"">Instance if <see cref=""IEngineLogger""/> performs logging operation.</param>
+    public class DeviceControlApiClient(LEDWallControllerEngine engine, ProcessObjectInteractionWorkItem workItem, IEngineLogger logger)
+    {
+        /// <summary>
+        /// Fetches the screen display parameters such as
+        /// brightness, color temperature, gamma from the
+        /// device.
+        /// </summary>
+        /// <param name=""ipAddress"">IP address of the device for communication</param>
+        /// <param name=""port"">Port at which the device listens</param>
+        /// <param name=""token"">Instance of <see cref=""CancellationToken""/> for cancelling asynchronous operation.</param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<DisplayParameters>> FetchScreenDisplayEffectParameterAsync(CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var command = new GetDisplayParametersCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, token: token);
+
+            return response;
+        }
+
+        /// <summary>
+        /// Fetches information regarding all the screens
+        /// from the device.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<ScreenInformation>> FetchScreenInformationAsync(CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var command = new GetScreenInformationCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, token: token);
+            return response;
+        }
+
+        /// <summary>
+        /// Updates the brightness of the screens
+        /// of the provided ids, with the provided
+        /// value.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""screenId""></param>
+        /// <param name=""brightness""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<object>> SetBrightnessAsync(string[] screenId, double brightness, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var requestBody = new SetBrightness(screenId, brightness);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var command = new SetBrightnessCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                workItem.AddCurrentValue(engine.Brightness?.Identifier, brightness, ValueQuality.Good);
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        /// <summary>
+        /// Updates the color temperature of the screens
+        /// of the provided ids, with the provided values.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""screenId""></param>
+        /// <param name=""colorTemperature""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<object>> SetColorTemperatureAsync(string[] screenId, int colorTemperature, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var requestBody = new SetColorTemperature(screenId, colorTemperature);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var command = new SetColorTemperatureCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                workItem.AddCurrentValue(engine.ColorTemperature?.Identifier, colorTemperature, ValueQuality.Good);
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        /// <summary>
+        /// Updates the gamma of the screens
+        /// of the provided ids, with the provided
+        /// values.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""screenId""></param>
+        /// <param name=""colorTemperature""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<object>> SetGammaAsync(string[] screenId, double gamma, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var requestBody = new SetGamma(screenId, gamma);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var command = new SetGammaCommand(client);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                workItem.AddCurrentValue(engine.Gamma?.Identifier, gamma, ValueQuality.Good);
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        public async Task<DeviceApiOutcome<object>> SetDisplayStatusAsync(int?[] canvas, int status, CancellationToken token)
+        {
+            var client = CreateHttpClient(engine.Configuration.RequestTimeout);
+            var command = new SetDisplayStatusCommand(client);
+            var requestBody = new SetDisplayStatus(status, canvas);
+            var serializedBody = JsonSerializer.Serialize(requestBody);
+            var content = new StringContent(serializedBody);
+            var response = await ExecuteCommandAsync(command, engine.Configuration.IPAddress, engine.Configuration.PortNumber, content, token);
+            if (response.IsSuccess)
+            {
+                return DeviceApiOutcome<object>.Success(default!);
+            }
+
+            return DeviceApiOutcome<object>.Failure(response.Description);
+        }
+
+        public async Task<DeviceApiOutcome<T>> ExecuteCommandAsync<T>(Command<T> command, string ipAddress, int port, HttpContent? content = null, CancellationToken token = default)
+        {
+            try
+            {
+                var response = await command.ExecuteAsync(ipAddress, port, content, token);
+                if (response is null)
+                {
+                    return DeviceApiOutcome<T>.Failure($""Operation {nameof(command)} failed."");
+                }
+
+                return DeviceApiOutcome<T>.Success(response);
+            }
+            catch (JsonException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.JsonExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.JsonExceptionMessage);
+            }
+            catch (InvalidOperationException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.InvalidOperationExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.InvalidOperationExceptionMessage);
+            }
+            catch (ArgumentNullException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.RequestArgumentNullExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.RequestArgumentNullExceptionMessage);
+            }
+            catch (Exception ex) when (ex is SocketException || (ex is HttpRequestException && ex.InnerException is SocketException))
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.StatusNetworkErrorMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.StatusNetworkErrorMessage);
+            }
+            catch (TimeoutException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.StatusConnectionTimedoutMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.StatusConnectionTimedoutMessage);
+            }
+            catch (HttpRequestException ex)
+            {
+                logger.LogError(string.Format(Resources.RuntimeErrorControlLogMessage, nameof(command)), Resources.HttpRequestExceptionMessage, ex);
+                return DeviceApiOutcome<T>.Failure(Resources.HttpRequestExceptionMessage);
+            }
+            catch (TaskCanceledException)
+            {
+                logger.LogError($""Operation to execute {nameof(command)} is canceled"");
+            }
+            catch (OperationCanceledException)
+            {
+                logger.LogError($""Operation to execute {nameof(command)} is canceled"");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($""Unexpected error occurred while executing {nameof(command)}"", ex.Message, ex);
+            }
+
+            return DeviceApiOutcome<T>.Failure($""Operation {nameof(command)} failed."");
+        }
+
+        /// <summary>
+        /// Creates an instance of HttpClient
+        /// with some provided configurations.
+        /// </summary>
+        /// <returns></returns>
+        private static HttpClient CreateHttpClient(int timeout)
+        {
+            var serviceCollection = new ServiceCollection();
+            _ = serviceCollection.AddHttpClient(Options.DefaultName, c => { })
+                .ConfigurePrimaryHttpMessageHandler(_ => new HttpClientHandler
+                {
+                    ClientCertificateOptions = ClientCertificateOption.Automatic,
+                    ServerCertificateCustomValidationCallback = (httpRequestMessage, cert, cetChain, policyErrors) => true
+                })
+                .ConfigureHttpClient(c =>
+                {
+                    c.DefaultRequestHeaders.Add(""Accept"", ""application/json"");
+                    c.Timeout = TimeSpan.FromSeconds(timeout);
+                });
+            var provider = serviceCollection.BuildServiceProvider();
+
+            var factory = provider.GetRequiredService<IHttpClientFactory>();
+
+            return factory.CreateClient();
+        }
+    }
+}",provides method which perform control operation at the device. The class makes use of Basic authorization for communicating with the device.
+15,NovaStar LED Wall Controller,MetaInfoApiClient.cs,Http,System.Net.Http,"using CDC.Core.Logging;
+using CDC.Plugin.NovaStarLEDWallController.Communication.Commands;
+using CDC.Plugin.NovaStarLEDWallController.Engine;
+using CDC.Plugin.NovaStarLEDWallController.Models;
+using CDC.Plugin.NovaStarLEDWallController.Properties;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Polly;
+using Polly.Retry;
+using System.Net.Sockets;
+
+namespace CDC.Plugin.NovaStarLEDWallController.Communication
+{
+    public class MetaInfoApiClient(IEngineLogger logger, Action<UpdateExtensionStatusEventArgs> updateExtensionStatus, IHttpClientFactory? factory = null)
+    {
+        /// <summary>
+        /// Fetches information regarding the number of
+        /// screens and input cards attached to the
+        /// device.
+        /// </summary>
+        /// <param name=""ipAddress""></param>
+        /// <param name=""port""></param>
+        /// <param name=""timeout""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        public async Task<DeviceApiOutcome<MetaInfoResponse>> FetchMetaInfoAsync(string ipAddress, int port, int timeout, CancellationToken token)
+        {
+            var shouldHandleRetry = new PredicateBuilder<DeviceApiOutcome<MetaInfoResponse>>()
+                .Handle<Exception>()
+                .HandleResult(result => !result.IsSuccess);
+
+            var retryStrategyOptions = new RetryStrategyOptions<DeviceApiOutcome<MetaInfoResponse>>
+            {
+                ShouldHandle = shouldHandleRetry,
+                MaxRetryAttempts = int.MaxValue,
+                DelayGenerator = RetryDelayGenerator,
+                OnRetry = args => OnRetryCallbackAsync(args, ipAddress, token)
+            };
+
+            var resilienceStrategy = new ResiliencePipelineBuilder<DeviceApiOutcome<MetaInfoResponse>>()
+                .AddRetry(retryStrategyOptions)
+                .Build();
+
+            var metaData = await resilienceStrategy.ExecuteAsync(async (t) =>
+            {
+                token.ThrowIfCancellationRequested();
+
+                var client = CreateHttpClient(timeout);
+                var screenInfoCommand = new GetScreenInformationCommand(client);
+                var screenInfoResponse = await screenInfoCommand.ExecuteAsync(ipAddress, port, token: token);
+                var screenIds = screenInfoResponse?.Data?.Screens?.Select(c => c.ScreenID);
+
+                var inputSourcesCommand = new GetInputSourceListCommand(client);
+                var inputSourcesResponse = await inputSourcesCommand.ExecuteAsync(ipAddress, port, token: token);
+                var inputSources = inputSourcesResponse?.Data?.Select(c => c.Id);
+                var metaInfoResponse = new MetaInfoResponse(screenIds?.ToList(), inputSources?.ToList());
+
+                return DeviceApiOutcome<MetaInfoResponse>.Success(metaInfoResponse);
+            }, token);
+
+            return metaData;
+        }
+
+        private async ValueTask OnRetryCallbackAsync(OnRetryArguments<DeviceApiOutcome<MetaInfoResponse>> arguments, string ipAddress, CancellationToken token)
+        {
+            var exception = arguments.Outcome.Exception;
+            var description = arguments.Outcome.Result?.Description;
+            logger.LogError(""Exception occurred while fetching meta information."", arguments.Outcome.Exception?.Message, arguments.Outcome.Exception);
+
+            if (exception is SocketException || exception is TimeoutException)
+            {
+                await PingAsync(ipAddress, token);
+            }
+            else if (exception is not null)
+            {
+                updateExtensionStatus(new(exception.Message));
+            }
+            else if (description is not null)
+            {
+                updateExtensionStatus(new(description));
+            }
+        }
+
+        /// <summary>
+        /// PingAsync makes ping request to the device,
+        /// based on te response of ping request, Extension
+        /// Status Message is updated accordingly.
+        /// </summary>
+        /// <param name=""exception""></param>
+        /// <param name=""token""></param>
+        /// <returns></returns>
+        private async Task PingAsync(string ipAddress, CancellationToken token)
+        {
+            var icmpStatus = await IcmpStatusClient.ConnectAsync(ipAddress, token);
+            if (icmpStatus)
+            {
+                updateExtensionStatus(new(Resources.StatusDeviceNotAccessibleMessage));
+            }
+            else
+            {
+                updateExtensionStatus(new(Resources.StatusConnectionTimedoutMessage));
+            }
+        }
+
+        private static ValueTask<TimeSpan?> RetryDelayGenerator(RetryDelayGeneratorArguments<DeviceApiOutcome<MetaInfoResponse>> args)
+        {
+            if (args.Outcome.Exception is SocketException || args.Outcome.Exception is IOException || args.Outcome.Exception is TimeoutException)
+            {
+                return new(TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber)));
+            }
+            else
+            {
+                return new(TimeSpan.FromSeconds(0.5));
+            }
+        }
+
+        private HttpClient CreateHttpClient(int timeout)
+        {
+            if (factory is not null)
+            {
+                return factory.CreateClient();
+            }
+
+            var serviceCollection = new ServiceCollection();
+            _ = serviceCollection.AddHttpClient(Options.DefaultName, c => { })
+                .ConfigurePrimaryHttpMessageHandler(_ => new HttpClientHandler
+                {
+                    ClientCertificateOptions = ClientCertificateOption.Automatic,
+                    ServerCertificateCustomValidationCallback = (httpRequestMessage, cert, cetChain, policyErrors) => true
+                })
+                .ConfigureHttpClient(c =>
+                {
+                    c.DefaultRequestHeaders.Add(""Accept"", ""application/json"");
+                    c.Timeout = TimeSpan.FromSeconds(timeout);
+                });
+            var provider = serviceCollection.BuildServiceProvider();
+
+            var httpClientFactory = provider.GetRequiredService<IHttpClientFactory>();
+
+            return httpClientFactory.CreateClient();
+        }
+    }
+}","performs the communication with the device to fetch meta information. It retries until it gets a successful response and whenever it fails, it performs Ping operation to the device to check whether the device is active or not and triggers updateExtensionStatusMessage actions."
