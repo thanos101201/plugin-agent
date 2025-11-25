@@ -1,0 +1,45 @@
+# Use a lightweight Python base image
+# Change 3.9 to 3.12
+FROM python:3.12-slim
+
+# Set the working directory
+WORKDIR /app
+
+# Install system dependencies
+# (Combined into one RUN command for faster build and smaller image size)
+RUN pip install --no-cache-dir \
+    jupyter \
+    nbconvert \
+    fastapi \
+    uvicorn \
+    "pymongo[srv]" \
+    langchain_openai \
+    langchain_google_genai \
+    langchain_community \
+    langgraph.checkpoint.sqlite \
+    anthropic \
+    langgraph.checkpoint.mongodb \
+    pandas
+
+# Set Environment Variable (Note: In production, pass this securely at runtime, don't hardcode!)
+ENV GOOGLE_API_KEY="AIzaSyClINuzP_Bfzylr-n1ZrY8V7Y0-N-1zGhc"
+
+# --- FIX STARTS HERE ---
+
+# 1. Use JSON syntax ["src", "dest"] to handle spaces in the filename.
+# 2. Rename it to 'main.ipynb' during the copy to make it Python-friendly.
+COPY ["plug code - Sheet1.csv", "/app/plug code - Sheet1.csv"]
+COPY ["Plugin Agent Version 0.1.0.1.ipynb", "/app/main.ipynb"]
+
+# 3. Convert the renamed notebook.
+# This will generate a file named 'main.py'
+RUN jupyter nbconvert --to script main.ipynb
+
+# --- FIX ENDS HERE ---
+
+# Expose the port
+EXPOSE 8000
+
+# Command to run the app
+# "main:app" tells uvicorn to look inside 'main.py' for the 'app' object
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
